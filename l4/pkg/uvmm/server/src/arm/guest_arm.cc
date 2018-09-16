@@ -58,12 +58,13 @@ struct F : Factory
     auto gic = devs->vmm()->gic();
     devs->vmm()->register_mmio_device(gic, node);
 
-    L4vbus::Device vdev;
-    L4Re::chksys(vbus->bus()->root().device_by_hid(&vdev, "arm-gicc"),
-                 "getting ARM GIC from IO");
+    Virt_bus::Devinfo *devinfo =
+      vbus->find_unassigned_device_by_hid("arm-gicc");
+    if (!devinfo)
+      L4Re::chksys(-L4_ENODEV, "getting ARM GIC from IO");
 
     l4vbus_resource_t res;
-    L4Re::chksys(vdev.get_resource(0, &res),
+    L4Re::chksys(devinfo->io_dev().get_resource(0, &res),
                  "getting memory resource");
 
     Dbg(Dbg::Irq, Dbg::Info, "GIC").printf("ARM GIC: %08lx-%08lx\n",
@@ -72,6 +73,7 @@ struct F : Factory
     auto g2 = Vdev::make_device<Ds_handler>(vbus->io_ds(), 0,
                                             res.end - res.start + 1, res.start);
     devs->vmm()->register_mmio_device(g2, node, 1);
+    devinfo->set_proxy(gic);
     return gic;
   }
 };
@@ -147,34 +149,34 @@ Guest::setup_device_tree(Vdev::Device_tree dt)
 }
 
 void
-Guest::check_guest_constraints(Ram_ds *ram)
+Guest::check_guest_constraints(l4_addr_t base) const
 {
   Dbg warn(Dbg::Mmio, Dbg::Warn, "ram");
 
   if (guest_64bit)
     {
-      if (ram->vm_start() & ((1UL << 21) - 1))
+      if (base & ((1UL << 21) - 1))
         warn.printf(
           "\033[01;31mWARNING: Guest memory not 2MB aligned!\033[m\n"
           "       If you run a 64bit-Linux as a guest,\n"
           "       Linux will likely fail to boot as it expects\n"
           "       a 2MB alignment of its memory.\n"
           "       Current guest RAM alignment is only 0x%x\n",
-          1 << __builtin_ctz(ram->vm_start()));
+          1 << __builtin_ctz(base));
 
       return;
     }
 
-  if (ram->vm_start() & ((1UL << 27) - 1))
+  if (base & ((1UL << 27) - 1))
     warn.printf(
       "\033[01;31mWARNING: Guest memory not 128MB aligned!\033[m\n"
       "       If you run a 32bit-Linux as a guest,\n"
       "       Linux will likely fail to boot as it assumes\n"
       "       a 128MB alignment of its memory.\n"
       "       Current guest RAM alignment is only 0x%x\n",
-      1 << __builtin_ctz(ram->vm_start()));
+      1 << __builtin_ctz(base));
 
-  if (ram->vm_start() & ~0xf0000000)
+  if (base & ~0xf0000000)
     warn.printf(
       "WARNING: Guest memory not 256MB aligned!\n"
       "       If you run a 32bit-Linux as a guest, you might hit a bug\n"
@@ -184,13 +186,16 @@ Guest::check_guest_constraints(Ram_ds *ram)
       "       is floating around.\n");
 }
 
-L4virtio::Ptr<void>
-Guest::load_linux_kernel(Ram_ds *ram, char const *kernel, l4_addr_t *entry)
+l4_addr_t
+Guest::load_linux_kernel(Vm_ram *ram, char const *kernel, Ram_free_list *free_list)
 {
+  Guest_addr ram_base = free_list->first_free_address();
+
+  l4_addr_t entry = ~0ul;
   Boot::Binary_ds image(kernel);
   if (image.is_elf_binary())
     {
-      *entry = image.load_as_elf(ram);
+      entry = image.load_as_elf(ram, free_list);
       guest_64bit = image.is_elf64();
       if (!Guest_64bit_supported && guest_64bit)
         L4Re::chksys(-L4_EINVAL, "Running a 64bit guest on a 32bit host is "
@@ -200,15 +205,13 @@ Guest::load_linux_kernel(Ram_ds *ram, char const *kernel, l4_addr_t *entry)
     {
       char const *h = reinterpret_cast<char const *>(image.get_header());
 
-      *entry = ~0ul;
-
       if (Guest_64bit_supported
           && h[0x38] == 'A' && h[0x39] == 'R'
           && h[0x3A] == 'M' && h[0x3B] == '\x64') // Linux header ARM\x64
         {
           l4_uint64_t l = *reinterpret_cast<l4_uint64_t const *>(&h[8]);
           // Bytes 0xc-0xf have the size
-          *entry = image.load_as_raw(ram, l);
+          entry = image.load_as_raw(ram, ram_base + l, free_list);
           this->guest_64bit = true;
         }
       else if (   h[0x24] == 0x18 && h[0x25] == 0x28
@@ -216,35 +219,19 @@ Guest::load_linux_kernel(Ram_ds *ram, char const *kernel, l4_addr_t *entry)
         {
           l4_uint32_t l = *reinterpret_cast<l4_uint32_t const *>(&h[0x28]);
           // Bytes 0x2c-0x2f have the zImage size
-          *entry = image.load_as_raw(ram, l);
+          entry = image.load_as_raw(ram, ram_base + l, free_list);
         }
 
-      if (*entry == ~0ul)
+      if (entry == ~0ul)
         {
           enum { Default_entry =  0x208000 };
-          *entry = image.load_as_raw(ram, Default_entry);
+          entry = image.load_as_raw(ram, ram_base + Default_entry, free_list);
         }
     }
 
-  auto end = image.get_upper_bound();
+  check_guest_constraints(ram_base.get());
 
-  check_guest_constraints(ram);
-
-  /* If the kernel relocates itself it either decompresses itself
-   * directly to the final adress or it moves itself behind the end of
-   * bss before starting decompression. So we should be safe if we
-   * place anything (e.g. initrd/device tree) at 3/4 of the ram.
-   */
-  l4_size_t def_offs = l4_round_size((ram->size() * 3) / 4,
-                                     L4_SUPERPAGESHIFT);
-  L4virtio::Ptr<void> def_end(ram->vm_start() + def_offs);
-
-  if (def_end.get() < end.get())
-    L4Re::chksys(-L4_ENOMEM, "Not enough space to run Linux");
-
-  info().printf("Linux end at %llx, reserving space up to :%llx\n",
-                end.get(), def_end.get());
-  return def_end;
+  return entry;
 }
 
   /*
@@ -280,7 +267,7 @@ Guest::prepare_vcpu_startup(Vcpu_ptr vcpu, l4_addr_t entry) const
 
 void
 Guest::prepare_linux_run(Vcpu_ptr vcpu, l4_addr_t entry,
-                         Ram_ds * /* ram */, char const * /* kernel */,
+                         Vm_ram * /* ram */, char const * /* kernel */,
                          char const * /* cmd_line */, l4_addr_t dt_boot_addr)
 {
   prepare_vcpu_startup(vcpu, entry);
@@ -304,11 +291,8 @@ Guest::prepare_linux_run(Vcpu_ptr vcpu, l4_addr_t entry,
 void
 Guest::run(cxx::Ref_ptr<Cpu_dev_array> cpus)
 {
-  // If the device tree does not contain a valid timer node the timer might be
-  // invalid. Since the code relies on a valid timer we have to check before
-  // starting the guest.
   if (!_timer)
-    L4Re::chksys(-ENODEV, "No timer available, aborting");
+    warn().printf("WARNING: No timer found. Your guest will likely not work properly!\n");
 
   _cpus = cpus;
   for (auto cpu: *cpus.get())
@@ -585,7 +569,8 @@ Vmm::Guest::wait_for_timer_or_irq(Vcpu_ptr vcpu)
   l4_timeout_t to = L4_IPC_NEVER;
 
   auto *utcb = l4_utcb();
-  if ((l4_vcpu_e_read_32(*vcpu, L4_VCPU_E_CNTVCTL) & 3) == 1) // timer enabled and not masked
+  if (_timer
+      && (l4_vcpu_e_read_32(*vcpu, L4_VCPU_E_CNTVCTL) & 3) == 1) // timer enabled and not masked
     {
       // calculate the timeout based on the VTIMER values !
       auto cnt = vcpu.cntvct();
@@ -627,7 +612,8 @@ Vmm::Guest::handle_ppi(Vcpu_ptr vcpu)
       _gic->handle_maintenance_irq(vmm_current_cpu_id);
       break;
     case 1: // VTMR IRQ
-      _timer->inject();
+      if (_timer)
+        _timer->inject();
       break;
     default:
       Err().printf("unknown virtual PPI: %d\n", (int)vcpu.hsr().svc_imm());

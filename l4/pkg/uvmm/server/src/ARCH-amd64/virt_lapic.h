@@ -189,8 +189,8 @@ public:
     return nullptr;
   }
 
-  Region mmio_region() const
-  { return Region::ss(Lapic_mem_addr, Lapic_mem_size); }
+  Vmm::Region mmio_region() const
+  { return Vmm::Region::ss(Vmm::Guest_addr(Lapic_mem_addr), Lapic_mem_size); }
 
   cxx::Ref_ptr<Virt_lapic> get(unsigned core_no)
   {
@@ -211,17 +211,19 @@ public:
   // Mmio device if
   l4_umword_t read(unsigned reg, char, unsigned cpu_id)
   {
+    assert(cpu_id < Max_cores && _lapics[cpu_id]);
+
     l4_uint64_t val = -1;
-    if (cpu_id < Max_cores)
-        _lapics[cpu_id]->read_msr(reg2msr(reg), &val);
+    _lapics[cpu_id]->read_msr(reg2msr(reg), &val);
 
     return val;
   }
 
   void write(unsigned reg, char, l4_umword_t value, unsigned cpu_id)
   {
-    if (cpu_id < Max_cores)
-      _lapics[cpu_id]->write_msr(reg2msr(reg), value);
+    assert(cpu_id < Max_cores && _lapics[cpu_id]);
+
+    _lapics[cpu_id]->write_msr(reg2msr(reg), value);
   }
 
 private:
@@ -241,6 +243,8 @@ class Io_apic : public Ic, public Msi_distributor
   enum
   {
     Msi_address_interrupt_prefix = 0xfee,
+
+    Irq_cells = 1,// keep in sync with virt-pc.dts
   };
 
   struct Interrupt_request_compat
@@ -291,16 +295,24 @@ public:
 
   int dt_get_num_interrupts(Vdev::Dt_node const &node) override
   {
-    int size;
-    auto ret = node.get_prop<fdt32_t>("interrupts", &size);
-    Dbg().printf("VIRT_LAPIC: num interrupts: %i\n", size);
-    if (!ret || size == 0)
-      return 0;
-    return 1;
+    int size = 0;
+    auto prop = node.get_prop<fdt32_t>("interrupts", &size);
+
+    trace().printf("%s has %i interrupts\n", node.get_name(), size);
+
+    return prop ? (size / Irq_cells) : 0;
   }
 
-  unsigned dt_get_interrupt(Vdev::Dt_node const &, int) override
-  { return 1; }
+  unsigned dt_get_interrupt(Vdev::Dt_node const &node, int irq) override
+  {
+    auto *prop = node.check_prop<fdt32_t[Irq_cells]>("interrupts", irq + 1);
+
+    int irqnr = fdt32_to_cpu(prop[irq][0]);
+
+    trace().printf("%s gets interrupt %i\n", node.get_name(), irqnr);
+
+    return irqnr;
+  }
 
   // Msi_distributor interface
   void send(Vdev::Msi_msg message) const override

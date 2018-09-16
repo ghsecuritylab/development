@@ -43,7 +43,6 @@ class Pit_timer
     Channel_2_data = 2,
     Mode_command = 3,
 
-    Pit_irq_line = 32,
     Low_byte_mask = 0xff,
     High_byte_mask = 0xff00,
     High_byte_shift = 0x8,
@@ -80,14 +79,14 @@ class Pit_timer
 
   static constexpr int port2idx(int port) { return port >> 1; }
 
+  static Dbg trace() { return Dbg(Dbg::Irq, Dbg::Trace, "PIT"); }
+  static Dbg warn() { return Dbg(Dbg::Irq, Dbg::Warn, "PIT"); }
+
 public:
   Pit_timer(Gic::Ic *ic, int irq);
   virtual ~Pit_timer() = default;
 
   cxx::Ref_ptr<Vmm::Io_device> const port61() const { return _port61; }
-
-  static unsigned irq_line()
-  { return Pit_irq_line; }
 
   void io_out(unsigned port, Vmm::Mem_access::Width width,
               l4_uint32_t value) override;

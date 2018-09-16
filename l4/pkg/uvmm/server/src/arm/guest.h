@@ -14,7 +14,7 @@
 #include "device_tree.h"
 #include "generic_guest.h"
 #include "gic.h"
-#include "ram_ds.h"
+#include "vm_ram.h"
 #include "cpu_dev_array.h"
 #include "smc_device.h"
 
@@ -36,13 +36,13 @@ public:
 
   void setup_device_tree(Vdev::Device_tree dt);
 
-  L4virtio::Ptr<void> load_linux_kernel(Ram_ds *ram, char const *kernel,
-                                        l4_addr_t *entry);
+  l4_addr_t load_linux_kernel(Vm_ram *ram, char const *kernel,
+                              Ram_free_list *free_list);
 
   void prepare_vcpu_startup(Vcpu_ptr vcpu, l4_addr_t entry) const;
 
   void prepare_linux_run(Vcpu_ptr vcpu, l4_addr_t entry,
-                         Ram_ds *ram, char const *kernel,
+                         Vm_ram *ram, char const *kernel,
                          char const *cmd_line, l4_addr_t dt);
   void run(cxx::Ref_ptr<Cpu_dev_array> cpus);
   void reset_vcpu(Vcpu_ptr vcpu);
@@ -55,9 +55,6 @@ public:
 
   cxx::Ref_ptr<Gic::Dist> gic() const
   { return _gic; }
-
-  cxx::Ref_ptr<Vdev::Core_timer> timer() const
-  { return _timer; }
 
   void set_timer(cxx::Ref_ptr<Vdev::Core_timer> &timer)
   { _timer = timer; }
@@ -78,7 +75,7 @@ public:
 
 private:
   Cpu_dev *lookup_cpu(l4_uint32_t hwid) const;
-  void check_guest_constraints(Ram_ds *ram);
+  void check_guest_constraints(l4_addr_t ram_base) const;
   void arm_update_device_tree();
 
   cxx::Ref_ptr<Gic::Dist> _gic;

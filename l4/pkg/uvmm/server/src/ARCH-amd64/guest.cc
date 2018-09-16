@@ -30,7 +30,7 @@ Guest::create_instance()
   return guest;
 }
 
-void Guest::register_io_device(Region const &region,
+void Guest::register_io_device(Io_region const &region,
                                cxx::Ref_ptr<Io_device> const &dev)
 {
   // Check for overlapping regions!
@@ -47,71 +47,90 @@ void Guest::register_io_device(Region const &region,
                  region.start, region.end);
 }
 
-L4virtio::Ptr<void>
-Guest::load_linux_kernel(Ram_ds *ram, char const *kernel, l4_addr_t *entry)
+l4_addr_t
+Guest::load_linux_kernel(Vm_ram *ram, char const *kernel,
+                         Ram_free_list *free_list)
 {
+  l4_addr_t entry;
   Boot::Binary_ds image(kernel);
 
   if (image.is_elf_binary())
-    L4Re::chksys(-L4_EINVAL, "ELF binaries are not supported.");
+    {
+      entry = image.load_as_elf(ram, free_list);
+      _guest_t = Binary_type::Elf;
+    }
+  else
+    {
+      l4_uint8_t num_setup_sects =
+        *((char *)image.get_header() + Bp_setup_sects);
+      trace().printf("number of setup sections found: 0x%x\n", num_setup_sects);
 
-  l4_uint8_t num_setup_sects = *((char*)image.get_header() + Bp_setup_sects);
-  trace().printf("number of setup sections found: 0x%x\n", num_setup_sects);
+      // 512 is the size of a segment
+      l4_addr_t setup_sects_size = (num_setup_sects + 1) * 512;
 
-  // 512 is the size of a segment
-  l4_addr_t setup_sects_size = (num_setup_sects + 1) * 512;
+      if (Linux_kernel_start_addr < setup_sects_size)
+        L4Re::chksys(-L4_EINVAL,
+                     "Supplied kernel image contains an invalid number "
+                     " of setup sections (zeropage).");
 
-  if (Linux_kernel_start_addr < setup_sects_size)
-    L4Re::chksys(-L4_EINVAL, "Supplied kernel image contains an invalid number "
-                             " of setup sections (zeropage).");
+      entry = Linux_kernel_start_addr - setup_sects_size;
+      trace().printf("size of setup sections: 0x%lx\n", setup_sects_size);
+      trace().printf("loading binary at: 0x%lx\n", entry);
 
-  *entry = Linux_kernel_start_addr - setup_sects_size;
-  trace().printf("size of setup sections: 0x%lx\n", setup_sects_size);
-  trace().printf("loading binary at: 0x%lx\n", *entry);
+      // load the binary starting after the boot_params
+      auto z = image.load_as_raw(ram, ram->boot2guest_phys(entry), free_list);
+      trace().printf("Loaded kernel image as raw to 0x%lx\n", z);
+      trace().printf("load kernel as raw entry to 0x%lx\n",
+                     ram->guest_phys2boot(Vmm::Guest_addr(Linux_kernel_start_addr)));
+      _guest_t = Binary_type::Linux;
+    }
 
-  // load the binary starting after the boot_params
-  auto z = image.load_as_raw(ram, *entry);
-  trace().printf("Loaded kernel image as raw to 0x%lx\n", z);
-  trace().printf("load kernel as raw entry to 0x%lx\n",
-                 ram->boot_addr(Linux_kernel_start_addr));
+  // Reserve Zero-page and cmdline space: One page and 4k for the cmdline.
+  // XXX It shall move to prepare_linux_run, when the parameter set of that
+  // function is changed.
+  free_list->reserve_fixed(Vmm::Guest_addr(L4_PAGESIZE), L4_PAGESIZE + 0x1000);
 
-
-  return l4_round_size(image.get_upper_bound(), L4_LOG2_SUPERPAGESIZE);
+  return entry;
 }
 
-void Guest::prepare_linux_run(Vcpu_ptr vcpu, l4_addr_t entry, Ram_ds *ram,
+void Guest::prepare_linux_run(Vcpu_ptr vcpu, l4_addr_t entry, Vm_ram *ram,
                               char const * /* kernel */, char const *cmd_line,
                               l4_addr_t dt_boot_addr)
 {
   // use second memory page as zeropage location
-  Zeropage zpage(L4_PAGESIZE, entry);
+  Zeropage zpage(Vmm::Guest_addr(L4_PAGESIZE), entry);
 
-  // read initrd addr and size from device tree
-  L4virtio::Ptr<void> dt_addr(dt_boot_addr);
-  auto dt = Vdev::Device_tree(ram->access(dt_addr));
-  int prop_sz1, prop_sz2;
-  auto node = dt.path_offset("/chosen");
-  auto prop_start = node.get_prop<fdt32_t>("linux,initrd-start", &prop_sz1);
-  auto prop_end = node.get_prop<fdt32_t>("linux,initrd-end", &prop_sz2);
-
-  if (prop_start && prop_end)
+  if (dt_boot_addr)
     {
-      auto rd_start = node.get_prop_val(prop_start, prop_sz1, 0);
-      auto rd_end = node.get_prop_val(prop_end, prop_sz2, 0);
-      zpage.add_ramdisk(rd_start, rd_end - rd_start);
+      // read initrd addr and size from device tree
+      Vmm::Guest_addr dt_addr = ram->boot2guest_phys(dt_boot_addr);
+      auto dt = Vdev::Device_tree(ram->guest2host<void *>(dt_addr));
+      int prop_sz1, prop_sz2;
+      auto node = dt.path_offset("/chosen");
+      auto prop_start = node.get_prop<fdt32_t>("linux,initrd-start", &prop_sz1);
+      auto prop_end = node.get_prop<fdt32_t>("linux,initrd-end", &prop_sz2);
+
+      if (prop_start && prop_end)
+        {
+          auto rd_start = node.get_prop_val(prop_start, prop_sz1, 0);
+          auto rd_end = node.get_prop_val(prop_end, prop_sz2, 0);
+          zpage.add_ramdisk(rd_start, rd_end - rd_start);
+        }
+      else
+        warn().printf("No ramdisk found in device tree.\n");
+
+      zpage.add_dtb(dt_boot_addr, dt.size());
     }
-  else
-      warn().printf("No ramdisk found in device tree.\n");
 
   if (cmd_line)
     zpage.add_cmdline(cmd_line);
 
-  zpage.cfg_e820(ram->size());
+  zpage.cfg_e820(ram);
   // write zeropage to VM ram
-  zpage.write(ram);
+  zpage.write(ram, _guest_t);
 
-  vcpu->r.ip = *(reinterpret_cast<l4_addr_t*>(zpage.entry(ram)));
-  vcpu->r.si = zpage.addr();
+  vcpu->r.ip = zpage.entry(ram);
+  vcpu->r.si = zpage.addr().get();
 
   trace().printf("Zeropage setup: vCPU ip: 0x%lx, si: 0x%lx\n", vcpu->r.ip,
                  vcpu->r.si);

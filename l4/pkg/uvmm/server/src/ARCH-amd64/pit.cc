@@ -45,7 +45,7 @@ void Pit_timer::io_out(unsigned port, Vmm::Mem_access::Width width,
       _mode.raw = value;
       if (_mode.channel() == 1)
         {
-          Dbg().printf("WARNING: set mode for channel 1 unsupported\n");
+          warn().printf("set mode for channel 1 unsupported\n");
           return;
         }
       int ch = _mode.channel() >> 1;
@@ -65,12 +65,12 @@ void Pit_timer::io_out(unsigned port, Vmm::Mem_access::Width width,
       else
         _ch_mode[ch] = 0xFF;
 
-      Dbg().printf("!!! PIT !!!   New timer mode: 0x%x\n", value);
+      trace().printf("New timer mode: 0x%x\n", value);
       break;
     }
     case Channel_0_data:
     case Channel_2_data:
-      Dbg().printf("!!! PIT !!!   Writing 0x%x for channel %d\n", value,
+      trace().printf("Writing 0x%x for channel %d\n", value,
                    port);
       if (!is_latch_count_value_cmd(_mode) && is_current_channel(_mode, port))
         {
@@ -98,13 +98,13 @@ void Pit_timer::io_out(unsigned port, Vmm::Mem_access::Width width,
           else if (_mode.access() == Access_hibyte)
             set_high_byte(_reload[ch], v);
 
-          Dbg().printf("!!! PIT !!!   enable counter for %d\n", port);
+          trace().printf("enable counter for %d\n", port);
           _counter[ch] = _reload[ch] >> 2;
           if (_reload[ch] != 0)
             _ch_mode[ch] = _mode.access();
         }
       else
-        Dbg().printf("WARNING: PIT access to bad channel\n");
+        warn().printf("PIT access to bad channel\n");
       break;
   }
 }
@@ -181,12 +181,16 @@ struct F : Vdev::Factory
     if (!ic)
       return nullptr;
 
+    auto irqs = ic->dt_get_num_interrupts(node);
+    if (irqs == 0)
+      return nullptr;
+
     auto dev = Vdev::make_device<Vdev::Pit_timer>(ic.get(),
-                                                  Vdev::Pit_timer::irq_line());
+                                                  ic->dt_get_interrupt(node, 0));
 
     auto *vmm = devs->vmm();
-    vmm->register_io_device(Region(0x40, 0x43), dev);
-    vmm->register_io_device(Region(0x61, 0x61), dev->port61());
+    vmm->register_io_device(Vmm::Io_region(0x40, 0x43), dev);
+    vmm->register_io_device(Vmm::Io_region(0x61, 0x61), dev->port61());
     vmm->register_timer_device(dev);
 
     return dev;

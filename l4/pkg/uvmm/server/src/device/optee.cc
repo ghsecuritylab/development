@@ -89,7 +89,7 @@ public:
     if (ret < 0 || p[0] != Optee_uuid_word0 || p[1] != Optee_uuid_word1 ||
         p[2] != Optee_uuid_word2 || p[3] != Optee_uuid_word3)
       {
-        warn.printf("OP-TEE not runing.\n");
+        warn.printf("OP-TEE not running.\n");
         return -L4_ENODEV;
       }
 
@@ -98,12 +98,12 @@ public:
 
     if (ret < 0 || p[0] != Optee_api_major || p[1] != Optee_api_minor)
       {
-        warn.printf("OP-TEE has wrong API (%ld.%ld). Need 2.0.\n",
-                    p[0], p[1]);
+        warn.printf("OP-TEE has wrong API (%ld.%ld). Need %x.%x.\n",
+                    p[0], p[1], Optee_api_major, Optee_api_minor);
         return -L4_EINVAL;
       }
 
-    // check if the OS exports memory
+    // check if OP-TEE exports memory
     ret = fast_call(0xb2000009, p);
 
     if (ret < 0 || p[0] != 0 || !(p[1] & 1))
@@ -124,7 +124,8 @@ public:
     trace.printf("OP-TEE start = 0x%lx  size = 0x%lx\n", p[1], p[2]);
     auto handler = Vdev::make_device<Ds_handler>(iods, 0, p[2], p[1]);
     // XXX should check that the resource is actually available
-    vmm->add_mmio_device(Region(p[1], p[1] + p[2] - 1), handler);
+    vmm->add_mmio_device(Vmm::Region(Vmm::Guest_addr(p[1]),
+                                     Vmm::Guest_addr(p[1] + p[2] - 1)), handler);
 
     return L4_EOK;
   }

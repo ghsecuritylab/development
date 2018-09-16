@@ -21,7 +21,7 @@ class Virtio_proxy_pci
 {
 public:
   Virtio_proxy_pci(L4::Cap<L4virtio::Device> device, l4_uint64_t config_sz,
-                   unsigned nnq_id, Vmm::Ram_ds *ram,
+                   unsigned nnq_id, Vmm::Vm_ram *ram,
                    cxx::Ref_ptr<Gic::Msi_distributor> distr,
                    unsigned num_msix_entries)
   : Virtio_proxy<Virtio_proxy_pci>(device, config_sz, nnq_id, ram),
@@ -151,7 +151,7 @@ struct F : Factory
                                     msi_distr, num_msix);
 
     if (regs[1].flags & Dt_pci_flags_io)
-      vmm->register_io_device(Region::ss(regs[1].base, regs[1].size), proxy);
+      vmm->register_io_device(Vmm::Io_region::ss(regs[1].base, regs[1].size), proxy);
 
     proxy->register_irq(devs->vmm()->registry());
     proxy->configure(regs, num_msix);

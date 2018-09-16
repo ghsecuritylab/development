@@ -11,7 +11,7 @@ TARGET          = uvmm
 SRC_CC          = main.cc ram_ds.cc generic_guest.cc \
                   cpu_dev_array.cc generic_cpu_dev.cc \
                   ARCH-$(ARCH)/cpu_dev.cc \
-                  device_factory.cc \
+                  host_dt.cc device_factory.cc \
                   virtio_console.cc \
                   virtio_proxy.cc \
                   virtio_device_proxy.cc \
@@ -19,7 +19,8 @@ SRC_CC          = main.cc ram_ds.cc generic_guest.cc \
                   virt_bus.cc io_proxy.cc \
                   mmio_device.cc \
                   mmio_proxy.cc \
-                  pm.cc vbus_event.cc vm.cc
+                  pm.cc vbus_event.cc vm_memmap.cc vm_ram.cc vm.cc \
+                  virq.cc
 
 SRC_CC-arm   = arm/gic.cc arm/guest_arm.cc arm/cpu_dev_arm.cc
 SRC_CC-arm64 = arm/gic.cc arm/guest_arm.cc arm/cpu_dev_arm.cc
@@ -34,6 +35,11 @@ SRC_CC-$(CONFIG_VDEV_8250) += device/uart_8250.cc
 SRC_CC-$(CONFIG_VDEV_PL011) += device/pl011.cc
 SRC_CC-arm-$(CONFIG_VDEV_OPTEE) += device/optee.cc
 SRC_CC-arm64-$(CONFIG_VDEV_OPTEE) += device/optee.cc
+SRC_CC-$(CONFIG_VDEV_VIRTIO_POWER) += device/virtio_input_power.cc
+
+ifeq ($(CONFIG_VDEV_VIRTIO_POWER),y)
+CXXFLAGS += -DVIRTIO_POWER
+endif
 
 ifeq ($(ARCH),mips)
 SRC_CC        += ARCH-$(ARCH)/guest_entry.cc

@@ -24,6 +24,7 @@
 #include "vmprint.h"
 #include "zeropage.h"
 #include "pt_walker.h"
+#include "vm_ram.h"
 
 namespace Vmm {
 
@@ -45,7 +46,7 @@ public:
 
   void show_state_interrupts(FILE *, Vcpu_ptr) {}
 
-  void register_io_device(Region const &region,
+  void register_io_device(Io_region const &region,
                           cxx::Ref_ptr<Io_device> const &dev);
 
   void register_timer_device(cxx::Ref_ptr<Vdev::Timer> const &dev)
@@ -53,10 +54,10 @@ public:
     _clock.add_timer(dev);
   }
 
-  L4virtio::Ptr<void> load_linux_kernel(Ram_ds *ram, char const *kernel,
-                                        l4_addr_t *entry);
+  l4_addr_t load_linux_kernel(Vm_ram *ram, char const *kernel,
+                              Ram_free_list *free_list);
 
-  void prepare_linux_run(Vcpu_ptr vcpu, l4_addr_t entry, Ram_ds *ram,
+  void prepare_linux_run(Vcpu_ptr vcpu, l4_addr_t entry, Vm_ram *ram,
                          char const *kernel, char const *cmd_line,
                          l4_addr_t dt_boot_addr);
 
@@ -105,7 +106,7 @@ private:
     return ax & Max_phys_addr_bits_mask;
   }
 
-  typedef std::map<Region, cxx::Ref_ptr<Io_device>> Io_mem;
+  typedef std::map<Io_region, cxx::Ref_ptr<Io_device>> Io_mem;
   Io_mem _iomap;
 
   // devices
@@ -113,6 +114,7 @@ private:
   Guest_print_buffer _hypcall_print;
   Pt_walker _ptw;
   cxx::Ref_ptr<Gic::Lapic_array> _apics;
+  Binary_type _guest_t;
 };
 
 } // namespace Vmm

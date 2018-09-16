@@ -294,7 +294,7 @@ public:
    *
    * \return 0 on success, libfdt error codes otherwise
    */
-  int delprop(char const *name)
+  int delprop(char const *name) const
   { return fdt_delprop(_tree, _node, name); }
 
   bool is_enabled() const
@@ -357,6 +357,14 @@ public:
         break;
       }
     return val;
+  }
+
+  int set_prop_partial(char const *property, uint32_t idx,
+                        const void *val, int len) const
+  {
+    return fdt_setprop_inplace_namelen_partial(_tree, _node,
+                                               property, strlen(property),
+                                               idx, val, len);
   }
 
   /**
@@ -544,32 +552,36 @@ public:
   /**
    * Find IRQ parent of node.
    *
-   * \retval  valid node - Node of IRQ parent
-   * \retval  invalid node - node does not have an IRQ parent
+   * \return  The node of the IRQ parent or an invalid node, if no parent is
+   *          found.
    *
-   * Traverses the device tree upwards and tries to find the  IRQ parent. If no
+   * Traverses the device tree upwards and tries to find the IRQ parent. If no
    * IRQ parent is found or the IRQ parent is identical to the node itself an
    * invalid node is returned.
    */
   Node find_irq_parent() const
   {
-    int node = _node;
+    Node node = *this;
 
-    while (node >= 0)
+    while (node.is_valid())
       {
-        auto *prop = fdt_getprop(_tree, node, "interrupt-parent", nullptr);
+        int size = 0;
+        auto *prop = node.get_prop<fdt32_t>("interrupt-parent", &size);
+
         if (prop)
           {
-            auto *phdl = reinterpret_cast<fdt32_t const *>(prop);
-            node = fdt_node_offset_by_phandle(_tree, fdt32_to_cpu(phdl[0]));
+            int idx = (size > 0)
+                        ? fdt_node_offset_by_phandle(_tree, fdt32_to_cpu(*prop))
+                        : -1;
+            node = Node(_tree, idx);
           }
         else
-          node = fdt_parent_offset(_tree, node);
+          node = node.parent_node();
 
-        if (node >= 0 && fdt_getprop(_tree, node, "#interrupt-cells", nullptr))
+        if (node.is_valid() && node.has_prop("#interrupt-cells"))
           {
-            if (node != _node)
-              return Node(_tree, node);
+            if (node != *this)
+              return node;
             else
               break;
           }
@@ -688,14 +700,17 @@ public:
             bool skip_disabled = true) const;
 
   /**
-   * Delete all nodes with specific property value.
+   * Delete all nodes with specific property value and status.
    *
-   * \param prop  Property to compare.
-   * \param value Node is deleted if `prop` has this value.
+   * \param prop             Property to compare.
+   * \param value            Node is deleted if `prop` has this value.
+   * \param delete_disabled  Delete only disabled nodes if true, otherwise
+   *                         delete all
    *
    * \return 0 on success, negative fdt_error otherwise
    */
-  int remove_nodes_by_property(char const *prop, char const *value) const
+  int remove_nodes_by_property(char const *prop, char const *value,
+                               bool delete_disabled) const
   {
     Node node = first_node();
 
@@ -706,7 +721,8 @@ public:
 
         property = node.template get_prop<char>(prop, &prop_size);
 
-        if (property && strncmp(value, property, prop_size) == 0)
+        if (   (property && strncmp(value, property, prop_size) == 0)
+            && (!delete_disabled || !node.is_enabled()))
           {
             int err = node.del_node();
             if (err)

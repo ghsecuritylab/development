@@ -103,8 +103,8 @@ protected:
   }
 
 public:
-  Dev(Vmm::Vm_ram *iommu, l4_uint32_t vendor, l4_uint32_t device)
-  : _iommu(iommu)
+  Dev(Vmm::Vm_ram *ram, l4_uint32_t vendor, l4_uint32_t device)
+  : _ram(ram)
   {
     auto *e = L4Re::Env::env();
     auto ds = L4Re::chkcap(L4Re::Util::make_unique_del_cap<L4Re::Dataspace>());
@@ -166,27 +166,30 @@ public:
 
   template<typename T>
   T *devaddr_to_virt(l4_addr_t devaddr, l4_size_t len = 0) const
-  {
-    if (devaddr < _iommu->vm_start()
-        || devaddr - _iommu->vm_start() + len > _iommu->size())
-      L4Re::chksys(-L4_ERANGE, "Virtio pointer outside RAM region");
-
-    return _iommu->access(L4virtio::Ptr<T>(devaddr));
-  }
+  { return _ram->guest2host<T *>(Vmm::Region::ss(Vmm::Guest_addr(devaddr), len)); }
 
 private:
-  Vmm::Vm_ram *_iommu;
+  Vmm::Vm_ram *_ram;
 };
 
 
 template<typename DEV>
 class Mmio_connector
 {
-private:
+  enum { Device_config_start = 0x100 };
+
+protected:
   template<typename T>
   void writeback_cache(T const *p)
   {
     l4_cache_clean_data((l4_addr_t)p, (l4_addr_t)p + sizeof(T) - 1);
+  }
+
+  template<typename T>
+  T *virtio_device_config()
+  {
+    return reinterpret_cast<T *>(  (l4_addr_t)dev()->virtio_cfg()
+                                 + Device_config_start);
   }
 
 public:
@@ -208,11 +211,11 @@ public:
 
     if (L4_UNLIKELY(reg & ((1U << size) - 1)))
       return;
-    if (reg >= 0x100)
+    if (reg >= Device_config_start)
       {
         l4_addr_t a = (l4_addr_t)vcfg + reg;
         if (Vmm::Mem_access::write_width(a, value, size) == L4_EOK)
-          dev()->virtio_device_config_written(reg);
+          dev()->virtio_device_config_written(reg - Device_config_start);
         return;
       }
 
