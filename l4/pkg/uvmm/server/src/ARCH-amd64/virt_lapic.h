@@ -21,7 +21,10 @@
 #include "vm_state.h"
 #include "pt_walker.h"
 #include "ram_ds.h"
-#include "msi_distributor.h"
+#include "msi_controller.h"
+#include "msr_device.h"
+#include "mem_types.h"
+#include "mmio_device.h"
 
 using L4Re::Rm;
 
@@ -42,7 +45,6 @@ class Virt_lapic : public Vdev::Timer, public Ic
     l4_uint32_t esr;
     l4_uint32_t cmci;
     l4_uint64_t icr;
-    l4_uint32_t timer;
     l4_uint32_t therm;
     l4_uint32_t perf;
     l4_uint32_t lint[2];
@@ -50,6 +52,24 @@ class Virt_lapic : public Vdev::Timer, public Ic
     l4_uint32_t tmr_init;
     l4_uint32_t tmr_cur;
     l4_uint32_t tmr_div;
+  };
+
+  struct Timer_reg
+  {
+    l4_uint32_t raw;
+    CXX_BITFIELD_MEMBER(17, 18, mode, raw);
+    CXX_BITFIELD_MEMBER(16, 16, masked, raw);
+    CXX_BITFIELD_MEMBER(12, 12, pending, raw);
+    CXX_BITFIELD_MEMBER(0, 7, vector, raw);
+
+    Timer_reg() : raw(0x00010000) {}
+    explicit Timer_reg(l4_uint32_t t) : raw(t) {}
+
+    Timer_reg &operator = (l4_uint32_t t) { raw = t; return *this; }
+
+    bool one_shot() const { return !mode(); }
+    bool periodic() const { return mode() == 1; }
+    bool tsc_deadline() const { return mode() == 2; }
   };
 
   enum XAPIC_consts : unsigned
@@ -85,8 +105,7 @@ public:
   void bind_irq_source(unsigned, cxx::Ref_ptr<Irq_source> const &) override;
   cxx::Ref_ptr<Irq_source> get_irq_source(unsigned) const override;
 
-  int dt_get_num_interrupts(Vdev::Dt_node const &) override;
-  unsigned dt_get_interrupt(Vdev::Dt_node const &, int) override;
+  int dt_get_interrupt(fdt32_t const *prop, int propsz, int *read) const override;
 
   // Timer interface
   void tick() override;
@@ -142,8 +161,12 @@ public:
     return logical_id & did;
   }
 
+  l4_uint32_t id() const { return _lapic_x2_id; }
+  l4_uint32_t task_prio_class() const { return _regs.tpr & 0xf0; }
+
 private:
   static Dbg trace() { return Dbg(Dbg::Irq, Dbg::Trace, "LAPIC"); }
+  static Dbg warn() { return Dbg(Dbg::Irq, Dbg::Warn, "LAPIC"); }
 
   L4Re::Util::Unique_cap<L4::Irq> _lapic_irq; /// IRQ to notify VCPU
   l4_addr_t const _lapic_memory_address;
@@ -152,6 +175,7 @@ private:
   std::mutex _int_mutex;
   std::mutex _tmr_mutex;
   LAPIC_registers _regs;
+  Timer_reg _timer;
   l4_uint64_t _tsc_deadline;
   bool _x2apic_enabled;
   unsigned _irq_queued[256];
@@ -159,9 +183,10 @@ private:
 }; // class Virt_lapic
 
 
-#include "mmio_device.h"
-
-class Lapic_array : public Vmm::Mmio_device_t<Lapic_array>, public Vdev::Device
+class Lapic_array
+: public Vmm::Mmio_device_t<Lapic_array>,
+  public Vdev::Device,
+  public Vmm::Msr_device
 {
   enum
   {
@@ -180,13 +205,17 @@ public:
     assert((Lapic_mem_addr & _max_phys_addr_mask) == Lapic_mem_addr);
   }
 
-  Virt_lapic *get_by_dest_id(l4_uint32_t did) const
+  bool send_to_logical_dest_id(l4_uint32_t did, unsigned vec) const
   {
+    bool sent = false;
     for (auto &lapic : _lapics)
       if (lapic && lapic->match_ldr(did))
-        return lapic.get();
+        {
+          lapic->set(vec);
+          sent = true;
+        }
 
-    return nullptr;
+    return sent;
   }
 
   Vmm::Region mmio_region() const
@@ -195,6 +224,28 @@ public:
   cxx::Ref_ptr<Virt_lapic> get(unsigned core_no)
   {
     return (core_no < Max_cores) ? _lapics[core_no] : nullptr;
+  }
+
+  Virt_lapic *get_lowest_prio() const
+  {
+    // init value greater 15, as task priority is between 1 and 15;
+    l4_uint32_t prio = 20;
+    Virt_lapic *lowest_prio_apic = nullptr;
+
+    for (auto &lapic : _lapics)
+      {
+        if (!lapic)
+          continue;
+
+        auto apic_prio = lapic->task_prio_class();
+        if (apic_prio < prio)
+          {
+            prio = apic_prio;
+            lowest_prio_apic = lapic.get();
+          }
+      }
+
+    return lowest_prio_apic;
   }
 
   void register_core(unsigned core_no)
@@ -226,6 +277,21 @@ public:
     _lapics[cpu_id]->write_msr(reg2msr(reg), value);
   }
 
+  // Msr_device interface
+  bool read_msr(unsigned msr, l4_uint64_t *value, unsigned vcpu_no) override
+  {
+    assert(vcpu_no < Max_cores && _lapics[vcpu_no]);
+
+    return _lapics[vcpu_no]->read_msr(msr, value);
+  };
+
+  bool write_msr(unsigned msr, l4_uint64_t value, unsigned vcpu_no) override
+  {
+    assert(vcpu_no < Max_cores && _lapics[vcpu_no]);
+
+    return _lapics[vcpu_no]->write_msr(msr, value);
+  }
+
 private:
   static unsigned reg2msr(unsigned reg)
   { return (reg >> 4) | X2apic_msr_base; }
@@ -236,15 +302,20 @@ private:
 
 
 /**
- * IO-APIC representation for IRQ/MSI routing. WIP!
+ * MSI control for MSI routing. WIP!
+ *
+ * This class checks if the Redirection Hint is set, then it selects the LAPIC
+ * with the lowest interrupt priority as recipient and rewrites the DID field
+ * according to the Destination Mode.
+ * If RH=0 the MSI is sent to the specified LAPIC(s) according to the DM.
+ *
+ * Design wise, this class is located between IO-MMU and all LAPICs.
  */
-class Io_apic : public Ic, public Msi_distributor
+class Msi_control : public Msi_controller, public Vdev::Device
 {
   enum
   {
     Msi_address_interrupt_prefix = 0xfee,
-
-    Irq_cells = 1,// keep in sync with virt-pc.dts
   };
 
   struct Interrupt_request_compat
@@ -260,9 +331,6 @@ class Io_apic : public Ic, public Msi_distributor
     CXX_BITFIELD_MEMBER_RO(0, 1, reserved_0, raw);
 
     explicit Interrupt_request_compat(l4_uint64_t addr) : raw(addr) {};
-    bool is_phys_addr_mode() { return redirect_hint() && !dest_mode(); }
-    bool is_logical_addr_mode() { return redirect_hint() && dest_mode(); }
-    bool is_direct_addr_mode() { return !redirect_hint(); }
   };
 
   struct Msi_data_register_format
@@ -275,6 +343,89 @@ class Io_apic : public Ic, public Msi_distributor
     CXX_BITFIELD_MEMBER_RO( 0,  7, vector, raw);
 
     explicit Msi_data_register_format(l4_uint32_t data) : raw(data) {};
+  };
+
+public:
+  Msi_control(cxx::Ref_ptr<Lapic_array> apics) : _apics(apics) {}
+
+  // Msi_controller interface
+  void send(Vdev::Msi_msg message) const override
+  {
+    Interrupt_request_compat addr(message.addr);
+    Msi_data_register_format data(message.data);
+
+    if (addr.fixed() != Msi_address_interrupt_prefix)
+      {
+        trace().printf("Interrupt request prefix invalid; MSI dropped.\n");
+        return;
+      }
+
+    if (addr.redirect_hint())
+      {
+        // Find LAPIC with lowest TPR and send the MSI its way. We shortcut it
+        // here to improve performance. Alternatively, we can rewrite the MSI
+        // address to physical destination mode and wirte the local APIC ID to
+        // the DID field.
+        Virt_lapic *lapic = _apics->get_lowest_prio();
+
+        trace().printf(
+          "Lowest interrupt priority arbitration: send to LAPIC 0x%x\n",
+          lapic->id());
+
+        lapic->set(data.vector());
+        return;
+      }
+
+    if (!addr.dest_mode())
+      {
+        // physical addressing mode:
+        //   dest_id() references a local APIC ID
+        auto lapic = _apics->get(addr.dest_id()).get();
+        if (lapic)
+          {
+            lapic->set(data.vector());
+            return;
+          }
+      }
+    else
+      {
+        // logical addressing mode:
+        //   dest_id() is a bitmask of logical APIC ID targets
+        if (_apics->send_to_logical_dest_id(addr.dest_id(), data.vector()))
+          return;
+      }
+
+    info().printf(
+      "No valid LAPIC found; MSI dropped. MSI address 0x%llx, data 0x%x\n",
+      message.addr, message.data);
+  }
+
+private:
+  static Dbg trace() { return Dbg(Dbg::Irq, Dbg::Trace, "MSI-CTLR"); }
+  static Dbg info() { return Dbg(Dbg::Irq, Dbg::Info, "MSI-CTLR"); }
+  static Dbg warn() { return Dbg(Dbg::Irq, Dbg::Warn, "MSI-CTLR"); }
+
+  cxx::Ref_ptr<Lapic_array> _apics;
+}; // class Msi_control
+
+/**
+ * IO-APIC stub. WIP!
+ *
+ * TODO The Ic interface is a bit off, as there is no way to clear an IRQ, as
+ * the IO-APIC sends an MSI to the MSI-controller when a device sends a legacy
+ * IRQ.
+ *  set: send an MSI instead of the legacy IRQ (programmed by OS)
+ *  clear: nop
+ *  bind_irq_source:  ?
+ *  get_irq_source: ?
+ *  dt_get_interrupt: parse DT
+ *
+ */
+class Io_apic : public Ic
+{
+  enum
+  {
+    Irq_cells = 1,// keep in sync with virt-pc.dts
   };
 
 public:
@@ -293,70 +444,21 @@ public:
   cxx::Ref_ptr<Irq_source> get_irq_source(unsigned irq) const override
   { return _apics->get(0)->get_irq_source(irq); }
 
-  int dt_get_num_interrupts(Vdev::Dt_node const &node) override
+  int dt_get_interrupt(fdt32_t const *prop, int propsz, int *read) const override
   {
-    int size = 0;
-    auto prop = node.get_prop<fdt32_t>("interrupts", &size);
+    if (propsz < Irq_cells)
+      return -L4_ERANGE;
 
-    trace().printf("%s has %i interrupts\n", node.get_name(), size);
+    if (read)
+      *read = Irq_cells;
 
-    return prop ? (size / Irq_cells) : 0;
-  }
-
-  unsigned dt_get_interrupt(Vdev::Dt_node const &node, int irq) override
-  {
-    auto *prop = node.check_prop<fdt32_t[Irq_cells]>("interrupts", irq + 1);
-
-    int irqnr = fdt32_to_cpu(prop[irq][0]);
-
-    trace().printf("%s gets interrupt %i\n", node.get_name(), irqnr);
-
-    return irqnr;
-  }
-
-  // Msi_distributor interface
-  void send(Vdev::Msi_msg message) const override
-  {
-    Interrupt_request_compat addr(message.addr);
-    if (addr.fixed() != Msi_address_interrupt_prefix)
-      {
-        trace().printf("Interrupt request prefix invalid; MSI dropped.\n");
-        return;
-      }
-
-    Virt_lapic *lapic = nullptr;
-
-    if (addr.is_direct_addr_mode())
-      {
-        // Direct addressing mode: destination ID references a local APIC ID.
-        unsigned did = addr.dest_id();
-        lapic = _apics->get(did).get();
-      }
-    else if (addr.is_phys_addr_mode())
-      {
-        // physical addressing mode:
-        //   dest_id() references a local APIC ID
-        lapic = _apics->get(addr.dest_id()).get();
-      }
-    else
-      {
-        // logical addressing mode:
-        //   dest_id() is a bitmask of logical APIC ID targets
-        lapic = _apics->get_by_dest_id(addr.dest_id());
-      }
-
-    if (lapic)
-      {
-        Msi_data_register_format data(message.data);
-        lapic->set(data.vector());
-      }
-    else
-      trace().printf("No valid LAPIC found; MSI dropped. MSI address 0x%llx\n",
-                     message.addr);
+    return fdt32_to_cpu(prop[0]);
   }
 
 private:
   static Dbg trace() { return Dbg(Dbg::Irq, Dbg::Trace, "IO-APIC"); }
+  static Dbg info() { return Dbg(Dbg::Irq, Dbg::Info, "IO-APIC"); }
+  static Dbg warn() { return Dbg(Dbg::Irq, Dbg::Warn, "IO-APIC"); }
 
   cxx::Ref_ptr<Lapic_array> _apics;
 }; // class Io_apic

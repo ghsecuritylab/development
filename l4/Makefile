@@ -388,7 +388,7 @@ endif
 ifneq ($(CONFIG_INT_LD_NAME_SWITCH),)
 	$(VERBOSE) set -e; echo INT_LD_NAME=$$($(LD) 2>&1 | perl -p -e 's,^(.+/)?(.+):.+,$$2,') >> $(DROPSCONF_CONFIG_MK)
 endif
-	$(VERBOSE)emulations=$$(LANG= $(firstword $(LD)) --help |        \
+	$(VERBOSE)emulations=$$(LC_ALL=C $(firstword $(LD)) --help |     \
 	                        grep -i "supported emulations:" |        \
 	                        sed -e 's/.*supported emulations: //') ; \
 	unset found_it;                                                  \
@@ -507,7 +507,7 @@ FASTBOOT_BOOT_CMD    ?= fastboot boot
 check_and_adjust_ram_base:
 	$(VERBOSE)if [ -z "$(PLATFORM_RAM_BASE)" ]; then          \
 	  echo "ERROR: Platform \"$(PLATFORM_TYPE)\" not known."; \
-	  echo "Available platform:";                             \
+	  echo "Available platforms:";                            \
 	  $(MAKE) listplatforms;                                  \
 	  exit 1;                                                 \
 	fi
@@ -628,6 +628,7 @@ exportpack: $(if $(filter $(ARCH),x86 amd64),,$(QEMU_KERNEL_TYPE))
 	 TARGETDIR=$(EXPORTPACKTARGETDIR);                                \
 	 qemu=$(if $(QEMU_PATH),$(QEMU_PATH),$(QEMU_ARCH_MAP_$(ARCH)));   \
 	 QEMU=$$qemu L4DIR=$(L4DIR) QEMU_OPTIONS="$(QEMU_OPTIONS)"        \
+	 OUTPUT_DIR="$(BOOTSTRAP_OUTPUT_DIR)"                             \
 	 IMAGE_FILE="$(QEMU_KERNEL_FILE)"                                 \
 	 $(tool_envvars) $(common_envvars)                                \
 	  $(L4DIR)/tool/bin/genexportpack --timeout=$(GRUB_TIMEOUT)       \

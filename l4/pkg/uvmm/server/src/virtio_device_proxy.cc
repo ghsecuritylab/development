@@ -18,6 +18,7 @@
 #include "debug.h"
 #include "device_factory.h"
 #include "guest.h"
+#include "irq_dt.h"
 #include "mmio_device.h"
 
 namespace {
@@ -82,9 +83,15 @@ public:
   void init_device(Vdev::Device_lookup *devs,
                    Vdev::Dt_node const &self)
   {
-    cxx::Ref_ptr<Gic::Ic> ic = devs->get_or_create_ic_dev(self, true);
+    Irq_dt_iterator it(devs, self);
 
-    _irq_sink.rebind(ic.get(), ic->dt_get_interrupt(self, 0));
+    if (it.next(devs) < 0)
+      L4Re::chksys(-L4_EINVAL, "Virtio device proxy requires interrupt setup");
+
+    if (!it.ic_is_virt())
+      L4Re::chksys(-L4_EINVAL, "Virtio device proxy requires a virtual interrupt controller");
+
+    _irq_sink.rebind(it.ic().get(), it.irq());
 
     if (self.get_reg_val(1, &_drvmem_base, &_drvmem_size) < 0)
       {
@@ -304,23 +311,9 @@ struct F : Factory
   cxx::Ref_ptr<Device> create(Vdev::Device_lookup *devs,
                               Dt_node const &node) override
   {
-    int cap_name_len;
-    char const *cap_name = node.get_prop<char>("l4vmm,virtiocap", &cap_name_len);
-    if (!cap_name)
-      {
-        warn.printf("'l4vmm,virtiocap' property missing for virtio proxy device.\n");
-        return nullptr;
-      }
-
-    cap_name_len = strnlen(cap_name, cap_name_len);
-
-    auto cap = L4Re::Env::env()->get_cap<L4virtio::Device>(cap_name, cap_name_len);
+    auto cap = Vdev::get_cap<L4virtio::Device>(node, "l4vmm,virtiocap");
     if (!cap)
-      {
-        warn.printf("'l4vmm,virtiocap' property: capability %.*s is invalid.\n",
-                    cap_name_len, cap_name);
-        return nullptr;
-      }
+      return nullptr;
 
     l4_uint64_t cfg_addr;
     l4_uint64_t cfg_size;
@@ -331,6 +324,9 @@ struct F : Factory
         return nullptr;
       }
 
+    // XXX Here we assume, that cap_name is a null terminated string - other
+    //     places explicitly handle non null terminated strings
+    char const *cap_name = node.get_prop<char>("l4vmm,virtiocap", nullptr);
     auto c = make_device<Virtio_device_proxy>(cap_name, cfg_size);
     c->init_device(devs, node);
 

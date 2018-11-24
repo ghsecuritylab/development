@@ -22,7 +22,7 @@ class Virtio_proxy_pci
 public:
   Virtio_proxy_pci(L4::Cap<L4virtio::Device> device, l4_uint64_t config_sz,
                    unsigned nnq_id, Vmm::Vm_ram *ram,
-                   cxx::Ref_ptr<Gic::Msi_distributor> distr,
+                   cxx::Ref_ptr<Gic::Msi_controller> distr,
                    unsigned num_msix_entries)
   : Virtio_proxy<Virtio_proxy_pci>(device, config_sz, nnq_id, ram),
     Virtio_device_pci<Virtio_proxy_pci>(),
@@ -132,11 +132,8 @@ struct F : Factory
         return nullptr;
       }
 
-    auto io_apic = devs->device_from_node(node.find_irq_parent());
-    auto msi_distr = cxx::dynamic_pointer_cast<Gic::Msi_distributor>(io_apic);
-
-    if (!msi_distr)
-      L4Re::chksys(-L4_EINVAL, "IO-APIC is the IRQ parent of the device.");
+    auto msi_distr = devs->get_or_create_mc_dev(node);
+    Dbg().printf("Msi controller %p\n", msi_distr.get());
 
     int sz;
     unsigned nnq_id = -1U;

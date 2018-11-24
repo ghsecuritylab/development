@@ -18,6 +18,7 @@
 #include "device_factory.h"
 #include "guest.h"
 #include "irq.h"
+#include "irq_dt.h"
 #include "mmio_device.h"
 
 namespace {
@@ -318,28 +319,21 @@ struct F : Vdev::Factory
                                     Vdev::Dt_node const &node) override
   {
     Dbg(Dbg::Dev, Dbg::Info).printf("Create virtual pl011 console\n");
-    int cap_name_len;
-    L4::Cap<L4::Vcon> cap = L4Re::Env::env()->log();
 
-    char const *cap_name = node.get_prop<char>("l4vmm,pl011cap", &cap_name_len);
-    if (cap_name)
-      {
-        cap = L4Re::Env::env()->get_cap<L4::Vcon>(cap_name, cap_name_len);
-        if (!cap)
-          {
-            Dbg(Dbg::Dev, Dbg::Warn, "pl011")
-              .printf("'l4vmm,pl011cap' property: capability %.*s is invalid.\n",
-                      cap_name_len, cap_name);
-            return nullptr;
-          }
-      }
-
-    cxx::Ref_ptr<Gic::Ic> ic = devs->get_or_create_ic_dev(node, false);
-    if (!ic)
+    L4::Cap<L4::Vcon> cap = Vdev::get_cap<L4::Vcon>(node, "l4vmm,pl011cap",
+                                                    L4Re::Env::env()->log());
+    if (!cap)
       return nullptr;
 
-    auto c = Vdev::make_device<Pl011_mmio>(ic.get(),
-                                           ic->dt_get_interrupt(node, 0), cap);
+    Vdev::Irq_dt_iterator it(devs, node);
+
+    if (it.next(devs) < 0)
+      return nullptr;
+
+    if (!it.ic_is_virt())
+      L4Re::chksys(-L4_EINVAL, "PL011 requires a virtual interrupt controller");
+
+    auto c = Vdev::make_device<Pl011_mmio>(it.ic().get(), it.irq(), cap);
     c->register_obj(devs->vmm()->registry());
     devs->vmm()->register_mmio_device(c, node);
     return c;

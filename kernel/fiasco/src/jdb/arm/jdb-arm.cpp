@@ -184,20 +184,21 @@ Jdb::handle_user_request(Cpu_number cpu)
   Jdb_entry_frame *ef = Jdb::entry_frame.cpu(cpu);
   const char *str = (char const *)ef->r[0];
   Space * task = get_task(cpu);
-  char tmp;
 
   if (ef->debug_ipi())
     return cpu != Cpu_number::boot_cpu();
 
+  // arm32
   if (ef->error_code == ((0x33UL << 26) | 1))
     return execute_command_ni(task, str);
 
-  if (!str || !peek(str, task, tmp) || tmp != '*')
-    return false;
-  if (!str || !peek(str+1, task, tmp) || tmp != '#')
+  // arm64
+  unsigned opcode;
+  if (!peek((unsigned*)ef->ip(), task, opcode) ||
+      opcode != 0xd4200020) // brk #1
     return false;
 
-  return execute_command_ni(task, str+2);
+  return execute_command_ni(task, str);
 }
 
 IMPLEMENT inline
@@ -227,7 +228,7 @@ Jdb::init()
 
 
 PRIVATE static
-void *
+unsigned char *
 Jdb::access_mem_task(Address virt, Space * task)
 {
   // align
@@ -258,7 +259,7 @@ Jdb::access_mem_task(Address virt, Space * task)
     {
       auto pte = Kmem::kdir->walk(Virt_addr(addr));
       if (pte.is_valid())
-        return (void *)addr;
+        return (unsigned char *)addr;
     }
 
   Mem_unit::flush_vdcache();
@@ -285,8 +286,8 @@ Jdb::access_mem_task(Address virt, Space * task)
 
   Mem_unit::kernel_tlb_flush();
 
-  return (void *)(Mem_layout::Jdb_tmp_map_area
-                  + (phys & (Config::SUPERPAGE_SIZE - 1)));
+  return (unsigned char *)(Mem_layout::Jdb_tmp_map_area
+                           + (phys & (Config::SUPERPAGE_SIZE - 1)));
 }
 
 PUBLIC static
@@ -300,29 +301,11 @@ PUBLIC static
 int
 Jdb::peek_task(Address virt, Space * task, void *value, int width)
 {
-  void const *mem = access_mem_task(virt, task);
+  unsigned char const *mem = access_mem_task(virt, task);
   if (!mem)
     return -1;
 
-  switch (width)
-    {
-    case 1:
-        {
-          Mword dealign = (virt & (sizeof(Mword) - 1)) * 8;
-          *(Mword*)value = (*(Mword*)mem & (0xff << dealign)) >> dealign;
-        }
-	break;
-    case 2:
-        {
-          Mword dealign = ((virt & (sizeof(Mword) - 2)) >> 1) * 16;
-          *(Mword*)value = (*(Mword*)mem & (0xffff << dealign)) >> dealign;
-        }
-	break;
-    case 4:
-    case 8:
-      memcpy(value, mem, width);
-    }
-
+  memcpy(value, mem + (virt & (sizeof(Mword) - 1)), width);
   return 0;
 }
 
@@ -337,7 +320,7 @@ PUBLIC static
 int
 Jdb::poke_task(Address virt, Space * task, void const *val, int width)
 {
-  void *mem = access_mem_task(virt, task);
+  unsigned char *mem = access_mem_task(virt, task);
   if (!mem)
     return -1;
 

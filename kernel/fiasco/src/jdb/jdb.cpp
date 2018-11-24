@@ -530,6 +530,7 @@ Jdb::input_long_mode(Jdb::Cmd *cmd, char const **args)
       switch (c)
 	{
 	case KEY_BACKSPACE:
+	case KEY_BACKSPACE_2:
 	  if (buf.len() > 0)
 	    {
 	      cursor(Cursor_left);
@@ -790,13 +791,9 @@ Jdb::write_ll_ns(String_buffer *buf, Signed64 ns, bool sign)
       return;
     }
 
-  Console* gzip = Kconsole::console()->find_console(Console::GZIP);
   Mword _us = uns / 1000UL;
   Mword _ns = uns % 1000UL;
-  buf->printf("%3lu.%03lu %c ", _us, _ns,
-           gzip && gzip->state() & Console::OUTENABLED
-             ? '\265' 
-             : Config::char_micro);
+  buf->printf("%3lu.%03lu u ", _us, _ns);
 }
 
 PUBLIC static

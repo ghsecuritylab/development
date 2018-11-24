@@ -13,6 +13,7 @@
 #include "ds_mmio_mapper.h"
 #include "guest.h"
 #include "io_proxy.h"
+#include "irq_dt.h"
 #include "smc_device.h"
 
 namespace {
@@ -147,63 +148,47 @@ struct F : Vdev::Factory
   {
     Dbg(Dbg::Dev, Dbg::Info).printf("Create OP-TEE device\n");
 
-    int cap_name_len;
+    auto cap = Vdev::get_cap<L4::Arm_smccc>(node, "l4vmm,cap");
+    if (!cap)
+      return nullptr;
 
-    char const *cap_name = node.get_prop<char>("l4vmm,cap", &cap_name_len);
-    if (!cap_name)
-      {
-        warn.printf("l4vmm,cap property missing for OP-TEE device.\n");
-        return nullptr;
-      }
-
-    auto cap = L4Re::Env::env()->get_cap<L4::Arm_smccc>(cap_name);
-    if (!cap.is_valid())
-      {
-        warn.printf("'l4vmm,cap' property: capability '%.*s' is invalid.\n",
-                    cap_name_len, cap_name);
-        return nullptr;
-      }
+    auto dscap = Vdev::get_cap<L4Re::Dataspace>(node, "l4vmm,dscap", cap);
+    if (!dscap)
+      return nullptr;
 
     auto c = Vdev::make_device<Optee>(cap);
-
-    L4::Cap<L4Re::Dataspace> dscap;
-    cap_name = node.get_prop<char>("l4vmm,dscap", &cap_name_len);
-
-    if (cap_name)
-      {
-        dscap = L4Re::Env::env()->get_cap<L4Re::Dataspace>(cap_name);
-        if (!dscap.is_valid())
-          {
-            warn.printf("'l4vmm,dscap' property: capability '%.*s' is invalid.\n",
-                        cap_name_len, cap_name);
-            return nullptr;
-          }
-      }
-    else
-      dscap = L4::cap_reinterpret_cast<L4Re::Dataspace>(cap);
-
     if (c->map_optee_memory(devs->vmm(), dscap) < 0)
       return nullptr;
 
-    auto ic = devs->get_or_create_ic_dev(node, false);
+    Vdev::Irq_dt_iterator it(devs, node);
 
-    if (ic && ic->dt_get_num_interrupts(node) > 0)
+    if (it.next(devs) >= 0)
       {
-        // XXX Using a standard IO interrupt here. Possibly better to
-        // write our own non-masking irq svr.
-        auto irq_svr = Vdev::make_device<Vdev::Irq_svr>(0);
-
-        L4Re::chkcap(devs->vmm()->registry()->register_irq_obj(irq_svr.get()),
-            "Register IRQ handling server.");
-
         auto icu = L4::cap_dynamic_cast<L4::Icu>(cap);
-        L4Re::chksys(icu->bind(0, irq_svr->obj_cap()),
-            "Bind to IRQ to OP-TEE service.");
 
-        unsigned dt_irq = ic->dt_get_interrupt(node, 0);
+        if (icu)
+          {
+            if (!it.ic_is_virt())
+              L4Re::chksys(-L4_EINVAL, "OP-TEE device requires a virtual interrupt controller");
 
-        irq_svr->set_sink(ic.get(), dt_irq);
-        ic->bind_irq_source(dt_irq, irq_svr);
+            // XXX Using a standard IO interrupt here. Possibly better to
+            // write our own non-masking irq svr.
+            auto irq_svr = Vdev::make_device<Vdev::Irq_svr>(0);
+
+            L4Re::chkcap(devs->vmm()->registry()->register_irq_obj(irq_svr.get()),
+                "Register IRQ handling server.");
+
+            L4Re::chksys(icu->bind(0, irq_svr->obj_cap()),
+                "Bind to IRQ to OP-TEE service.");
+
+            int dt_irq = it.irq();
+            irq_svr->set_sink(it.ic().get(), dt_irq);
+            it.ic()->bind_irq_source(dt_irq, irq_svr);
+          }
+        else
+          // When no proxy is used, there is also no notification available.
+          // So it is not necessarily an error, when no ICU can be found.
+          warn.printf("SMC device does not support notification interrupts.\n");
       }
 
     devs->vmm()->register_smc_handler(c);

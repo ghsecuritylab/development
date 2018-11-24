@@ -236,8 +236,16 @@ struct Block_features : public Dev_config::Features
   CXX_BITFIELD_MEMBER( 5,  5, ro, raw);
   /** Block size of disk is in blk_size. */
   CXX_BITFIELD_MEMBER( 6,  6, blk_size, raw);
+  /** Cache flush command support. */
+  CXX_BITFIELD_MEMBER( 9,  9, flush, raw);
   /** Device exports information about optimal IO alignment. */
   CXX_BITFIELD_MEMBER(10, 10, topology, raw);
+  /** Device can toggle its cache between writeback and writethrough modes. */
+  CXX_BITFIELD_MEMBER(11, 11, config_wce, raw);
+  /** Device can support discard command. */
+  CXX_BITFIELD_MEMBER(13, 13, discard, raw);
+  /** Device can support write zeroes command. */
+  CXX_BITFIELD_MEMBER(14, 14, write_zeroes, raw);
 };
 
 
@@ -277,6 +285,9 @@ public:
   typedef Block_request<Ds_data> Request;
 
 protected:
+  Block_features negotiated_features() const
+  { return _dev_config.negotiated_features(0); }
+
   Block_features device_features() const
   { return _dev_config.host_features(0); }
 
@@ -365,6 +376,77 @@ protected:
     set_device_features(df);
   }
 
+  /** Enables the flush command. */
+  void set_flush()
+  {
+    Block_features df = device_features();
+    df.flush() = true;
+    set_device_features(df);
+  }
+
+  /** Sets cache mode and enables the the writeback toggle.
+   *
+   * \param writeback Mode of the cache (0 for writethrough, 1 for writeback).
+   */
+  void set_config_wce(l4_uint8_t writeback)
+  {
+    l4virtio_block_config_t volatile *pc = _dev_config.priv_config();
+    pc->writeback = writeback;
+    Block_features df = device_features();
+    df.config_wce() = true;
+    set_device_features(df);
+  }
+
+  /** Get the writeback field from the configuration space.
+   *
+   * \return Value of the writeback field.
+   */
+  l4_uint8_t get_writeback()
+  {
+    l4virtio_block_config_t volatile *pc = _dev_config.priv_config();
+    return pc->writeback;
+  }
+
+  /**
+   * Sets constraints for and enables the discard command.
+   *
+   * \param max_discard_sectors Maximum discard sectors size.
+   * \param max_discard_seg Maximum discard segment number.
+   * \param discard_sector_alignment Can be used by the driver when splitting a
+   *                                 request based on alignment.
+   */
+  void set_discard(l4_uint32_t max_discard_sectors, l4_uint32_t max_discard_seg,
+                   l4_uint32_t discard_sector_alignment)
+  {
+    l4virtio_block_config_t volatile *pc = _dev_config.priv_config();
+    pc->max_discard_sectors = max_discard_sectors;
+    pc->max_discard_seg = max_discard_seg;
+    pc->discard_sector_alignment = discard_sector_alignment;
+    Block_features df = device_features();
+    df.discard() = true;
+    set_device_features(df);
+  }
+
+  /**
+   * Sets constraints for and enables the write zeroes command.
+   *
+   * \param max_write_zeroes_sectors Maximum write zeroes sectors size.
+   * \param max_write_zeroes_seg maximum write zeroes segment number.
+   * \param write_zeroes_may_unmap Set if a write zeroes request can result in
+   *                               deallocating one or more sectors.
+   */
+  void set_write_zeroes(l4_uint32_t max_write_zeroes_sectors,
+                        l4_uint32_t max_write_zeroes_seg,
+                        l4_uint8_t write_zeroes_may_unmap)
+  {
+    l4virtio_block_config_t volatile *pc = _dev_config.priv_config();
+    pc->max_write_zeroes_sectors = max_write_zeroes_sectors;
+    pc->max_write_zeroes_seg = max_write_zeroes_seg;
+    pc->write_zeroes_may_unmap = write_zeroes_may_unmap;
+    Block_features df = device_features();
+    df.write_zeroes() = true;
+    set_device_features(df);
+  }
 
 public:
   /**
@@ -402,7 +484,7 @@ public:
    * For asynchronous mode, the function should set up the worker
    * and then return false. In synchronous mode, the function should
    * return true, once processing is complete. If there is an error
-   * and processing is aborted, the status flag of @req needs to be set
+   * and processing is aborted, the status flag of `req` needs to be set
    * accordingly and the request immediately finished with finish_request()
    * if the client is to be answered.
    */
@@ -502,7 +584,7 @@ protected:
 
   void kick()
   {
-    if (queue_stopped())
+    if (!_queue.ready() || queue_stopped())
       return;
 
     while (!_dev_config.status().failed())

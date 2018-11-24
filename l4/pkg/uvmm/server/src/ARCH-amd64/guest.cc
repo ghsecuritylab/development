@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2017 Kernkonzept GmbH.
+ * Copyright (C) 2018 Kernkonzept GmbH.
  * Author(s): Sarah Hoffmann <sarah.hoffmann@kernkonzept.com>
  *            Philipp Eppelt <philipp.eppelt@kernkonzept.com>
  *
@@ -43,8 +43,14 @@ void Guest::register_io_device(Io_region const &region,
 
   _iomap[region] = dev;
 
-  trace().printf("New io mappping: %p @ [0x%lx, 0x%lx]\n", dev.get(),
+  trace().printf("New io mapping: %p @ [0x%lx, 0x%lx]\n", dev.get(),
                  region.start, region.end);
+}
+
+void Guest::register_msr_device(cxx::Ref_ptr<Msr_device> const &dev)
+{
+  _msr_devices.push_back(dev);
+  trace().printf("New MSR device %p\n", dev.get());
 }
 
 l4_addr_t
@@ -174,34 +180,77 @@ Guest::handle_cpuid(l4_vcpu_regs_t *regs)
   auto rax = regs->ax;
   auto rcx = regs->cx;
 
-  asm("cpuid"
+  if (rax >= 0x40000000 && rax < 0x40010000)
+    {
+      switch (rax)
+        {
+        case 0x40000000:
+          a = 0x40000001;   // max CPUID leaf in the 0x4000'0000 range.
+          b = 0x4b4d564b;   // "KVMK"
+          c = 0x564b4d56;   // "VMKV"
+          d = 0x4d;         // "M\0\0\0"
+          break;
+
+        case 0x40000001:
+          enum Cpuid_kvm_constants
+          {
+            Kvm_feature_clocksource = 1UL, // clock at msr 0x11 & 0x12
+            Kvm_feature_clocksource2 = 1UL << 3, // clock at msrs 0x4b564d00 & 01;
+          };
+          a = Kvm_feature_clocksource2;
+          d = 0;
+          b = c = 0;
+          break;
+
+        default:
+          a = b = c = d = 0;
+        }
+    }
+  else
+    asm("cpuid"
       : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
-      : "0"(rax), "2"(regs->cx));
+      : "0"(rax), "2"(rcx));
+
+  if (0)
+    trace().printf("CPUID as read 0x%lx/0x%lx: a: 0x%x, b: 0x%x, c: 0x%x, d: 0x%x\n",
+                   rax, rcx, a, b, c, d);
 
   enum : unsigned long
   {
+    // 0x1
     Ecx_monitor_bit = (1UL << 3),
     Ecx_vmx_bit = (1UL << 5),
     Ecx_smx_bit = (1UL << 6),
+    Ecx_speed_step_tech_bit = (1UL << 7),
     Ecx_pcid_bit = (1UL << 17),
     Ecx_x2apic_bit = (1UL << 21),
     Ecx_xsave_bit = (1UL << 26),
+    // used to indicate the hypervisor presence to linux -- no hardware bit.
     Ecx_hypervisor_bit = (1UL << 31),
 
-    Edx_rdtsc_bit = (1UL << 4),
-    Edx_apic_bit = (1UL << 9),
     Edx_mtrr_bit = (1UL << 12),
+    Edx_mca = (1UL << 14),
+    Edx_pat = (1UL << 16),
+    Edx_acpi_bit = (1UL << 22),
 
-    Kvm_feature_clocksource_bit = 1UL,
+    // 0x6 EAX
+    Power_limit_notification = (1UL << 4),
+    Hwp_feature_mask = (0x1f << 7),
+    // 0x6 ECX
+    Performance_energy_bias_preference = (1UL << 3),
 
-    Rdtscp_bit = (1UL << 27),
-
+    // 0x7
+    Tsc_adjust = (1UL << 1),
     Invpcid_bit = (1UL << 10),
 
+    // 0xd
     Xsave_opt = 1,
     Xsave_c = (1UL << 1),
     Xget_bv = (1UL << 2),
     Xsave_s = (1UL << 3),
+
+    // 0x8000'0001
+    Rdtscp_bit = (1UL << 27),
   };
 
   switch (rax)
@@ -211,18 +260,23 @@ Guest::handle_cpuid(l4_vcpu_regs_t *regs)
       c &= ~(  Ecx_monitor_bit
              | Ecx_vmx_bit
              | Ecx_smx_bit
+             | Ecx_speed_step_tech_bit
              | Ecx_pcid_bit
-// if xsave is filtered out, CR4 bit not set, busybox userland will fail
-//             | Ecx_xsave_bit
-             | Ecx_hypervisor_bit
             );
+      c |= Ecx_hypervisor_bit;
 
-      d &= ~(Edx_mtrr_bit);
+      d &= ~(Edx_mtrr_bit | Edx_mca | Edx_pat | Edx_acpi_bit);
+      break;
+
+    case 0x6:
+      a &= ~(Power_limit_notification | Hwp_feature_mask);
+      // filter IA32_ENERGEY_PERF_BIAS
+      c &= ~(Performance_energy_bias_preference);
       break;
 
     case 0x7:
       if (!rcx)
-        b &= ~(Invpcid_bit); // filter, as it leads to unhandled VMM-entries.
+        b &= ~(Invpcid_bit | Tsc_adjust); // filter, as it leads to unhandled VMM-entries.
       break;
 
     case 0xa:
@@ -230,14 +284,33 @@ Guest::handle_cpuid(l4_vcpu_regs_t *regs)
       break;
 
     case 0xd:
-      if (regs->cx == 1)
+      switch(rcx)
         {
+        case 0:
+          {
+            // Check the host-enabled XCR0 bits and report these to the guest,
+            // instead of the physical hardware features.
+            // XXX If we report other than the host-enabled XCR0 bits, we need
+            // to adapt the size returned in ECX!
+            l4_uint32_t ax = 0, dx = 0;
+            asm volatile ("xgetbv" : "=a"(ax), "=d"(dx) : "c"(0));
+            trace().printf("Get XCR0 host state: 0x%x:0x%x\n", dx, ax);
+
+            a = ax;
+            break;
+          }
+
+        case 1:
           trace().printf("Filtering out xsave capabilities\n");
           a &= ~(  Xsave_opt
                    | Xsave_c
                    | Xget_bv // with ECX=1
                    | Xsave_s   // XSAVES/XRSTORS and IA32_XSS MSR
                 );
+          b = 0; // Size of the state of the enabled feature bits.
+          break;
+
+        default: break;
         }
       break;
 
@@ -247,6 +320,10 @@ Guest::handle_cpuid(l4_vcpu_regs_t *regs)
         break;
       }
     }
+
+  if (0)
+    trace().printf("CPUID as modified: a: 0x%x, b: 0x%x, c: 0x%x, d: 0x%x\n",
+                   a, b, c, d);
 
   regs->ax = a;
   regs->bx = b;
@@ -265,8 +342,39 @@ Guest::handle_vm_call(l4_vcpu_regs_t *regs)
       return Jump_instr;
     }
 
+  // NOTE: If the hypervisor bit is enabled in CPUID.01 there can be other VMCALL
+  // numbers defined for KVM, e.g. 0x9 for PTP_KVM.
   Err().printf("Unknown VMCALL 0x%lx\n", regs->ax);
   return -L4_ENOSYS;
+}
+
+bool
+Guest::msr_devices_rwmsr(l4_vcpu_regs_t *regs, bool write, unsigned vcpu_no)
+{
+  auto msr = regs->cx;
+
+  for (auto &dev : _msr_devices)
+    {
+      if (write)
+        {
+          l4_uint64_t value = (l4_uint64_t(regs->ax) & 0xFFFFFFFF)
+                              | (l4_uint64_t(regs->dx) << 32);
+          if (dev->write_msr(msr, value, vcpu_no))
+            return true;
+        }
+      else
+        {
+          l4_uint64_t result = 0;
+          if (dev->read_msr(msr, &result, vcpu_no))
+            {
+              regs->ax = (l4_uint32_t)result;
+              regs->dx = (l4_uint32_t)(result >> 32);
+              return true;
+            }
+        }
+    }
+
+  return false;
 }
 
 int
@@ -284,12 +392,6 @@ Guest::handle_exit_vmx(Vmm::Vcpu_ptr vcpu)
       .printf("Exit at guest IP 0x%lx with 0x%llx (Qual: 0x%llx)\n", vms->ip(),
               vms->vmx_read(L4VCPU_VMCS_EXIT_REASON),
               vms->vmx_read(L4VCPU_VMCS_EXIT_QUALIFICATION));
-
-  enum Apic_access_exit_qualifications
-  {
-    Page_offset_length = 12,
-    Page_offset_mask = (1 << Page_offset_length) - 1,
-  };
 
   switch (reason)
     {
@@ -370,10 +472,23 @@ Guest::handle_exit_vmx(Vmm::Vcpu_ptr vcpu)
       return vms->handle_cr_access(regs);
 
     case Exit::Exec_rdmsr:
-      return vms->handle_exec_rmsr(regs, lapic(vcpu));
+      if (!msr_devices_rwmsr(regs, false, vcpu.get_vcpu_id()))
+        {
+          warn().printf("Reading unsupported MSR 0x%lx\n", regs->cx);
+          regs->ax = 0;
+          regs->dx = 0;
+        }
+
+      return Jump_instr;
 
     case Exit::Exec_wrmsr:
-      return vms->handle_exec_wmsr(regs, lapic(vcpu));
+      if (msr_devices_rwmsr(regs, true, vcpu.get_vcpu_id()))
+        return Jump_instr;
+      else
+        {
+          warn().printf("Writing unsupported MSR 0x%lx\n", regs->cx);
+          return -L4_ENOSYS;
+        }
 
     case Exit::Virtualized_eoi:
       Dbg().printf("INFO: EOI virtualized for vector 0x%llx\n",
@@ -387,7 +502,7 @@ Guest::handle_exit_vmx(Vmm::Vcpu_ptr vcpu)
           l4_uint64_t value = (l4_uint64_t(regs->ax) & 0xFFFFFFFF)
                               | (l4_uint64_t(regs->dx) << 32);
           vms->vmx_write(L4_VM_VMX_VMCS_XCR0, value);
-          Dbg().printf("Setting xcr0 to 0x%llx\n", value);
+          trace().printf("Setting xcr0 to 0x%llx\n", value);
           return Jump_instr;
         }
       Dbg().printf("Writing unknown extended control register %ld\n", regs->cx);
@@ -433,6 +548,8 @@ Guest::run(cxx::Ref_ptr<Cpu_dev_array> const &cpus)
       _apics->get(vcpu_id)->attach_cpu_thread(cpu->thread_cap());
     }
 
+  register_msr_device(Vdev::make_device<Vcpu_msr_handler>(cpus.get()));
+
   Dbg(Dbg::Guest, Dbg::Info).printf("Starting VMM @ 0x%lx\n", cpus->vcpu(0)->r.ip);
 
   // TODO If SVM is implemented, we need to branch here for the Vm_state_t
@@ -446,6 +563,7 @@ Guest::run_vmx(cxx::Ref_ptr<Cpu_dev> const &cpu_dev)
   Vcpu_ptr vcpu = cpu_dev->vcpu();
   Vmx_state *vm = dynamic_cast<Vmx_state *>(vcpu.vm_state());
   assert(vm);
+
   L4::Cap<L4::Thread> myself;
   trace().printf("Starting vCPU 0x%lx\n", vcpu->r.ip);
 

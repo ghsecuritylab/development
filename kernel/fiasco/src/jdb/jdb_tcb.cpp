@@ -497,6 +497,14 @@ Jdb_tcb::show(Thread *t, int level, bool dump_only)
       redraw_screen = false;
     }
 
+  Address ksp  = is_current_thread ? ef->ksp()
+                                   : (Address)t->get_kernel_sp();
+
+#if 0
+  Address tcb  = (Address)context_of((void*)ksp);
+#endif
+  _stack_view.init(ksp, ef, is_current_thread);
+
 whole_screen:
 
   if (redraw_screen)
@@ -560,9 +568,9 @@ whole_screen:
   time_str.terminate();
   printf("%-13s", time_str.begin());
 
-  printf("\t\ttimeslice: %llu/%llu %cs\n"
+  printf("\t\ttimeslice: %llu/%llu us\n"
          "pager\t: ",
-         t->sched()->left(), ~0ULL/*t->sched()->quantum()*/, Config::char_micro);
+         t->sched()->left(), ~0ULL/*t->sched()->quantum()*/);
   print_kobject(t, t->_pager.raw());
 
   putstr("\ttask     : ");
@@ -618,14 +626,6 @@ whole_screen:
     }
   else
     putstr("---\nvCPU    : ---\n");
-
-  Address ksp  = is_current_thread ? ef->ksp()
-                                   : (Address)t->get_kernel_sp();
-
-#if 0
-  Address tcb  = (Address)context_of((void*)ksp);
-#endif
-  _stack_view.init(ksp, ef, is_current_thread);
 
   if (is_current_thread)
     print_entry_frame_regs(t);

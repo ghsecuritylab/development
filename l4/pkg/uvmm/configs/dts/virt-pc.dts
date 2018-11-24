@@ -23,6 +23,12 @@
             #interrupt-cells = <1>;
         };
 
+        msi_ctlr: msictlr {
+            compatible = "intel,msi-controller";
+            msi-controller;
+            #msi-cells = <0>;
+        };
+
         cpus {
           #address-cells = <1>;
           #size-cells = <0>;
@@ -49,6 +55,11 @@
             reg = <0x0 0x0 0x0 0x0>;
         };
 
+        kvm_clock {
+            compatible = "kvm-clock";
+            reg = <0x0 0x0 0x0 0x0>;
+        };
+
         pci0: pci@aaaa0000 {
             compatible = "virt-pci-bridge";
             // reg 1: MMIO memory area for PCI devices
@@ -72,7 +83,7 @@
               // we currently only resolve references for the interrupt-parent
               // property. This is only a preliminary measure and must be fixed
               // ASAP.
-              interrupt-parent = <&IOAPIC>;
+              msi-parent = <&msi_ctlr>;
               l4vmm,vdev = "console";
             };
         };

@@ -1,33 +1,8 @@
 #include "device_factory.h"
 #include "guest.h"
 #include "irq.h"
+#include "irq_dt.h"
 #include "mmio_device.h"
-
-static L4::Cap<L4::Irq>
-get_irq_cap(Vdev::Dt_node const &node)
-{
-  int cap_name_len;
-  char const *cap_name = node.get_prop<char>("l4vmm,virqcap", &cap_name_len);
-  if (!cap_name)
-    {
-      Dbg(Dbg::Dev, Dbg::Warn, "virq")
-        .printf("%s: 'l4vmm,virqcap' property missing.\n", node.get_name());
-      return L4::Cap<L4::Irq>();
-    }
-
-  cap_name_len = strnlen(cap_name, cap_name_len);
-
-  auto cap = L4Re::Env::env()->get_cap<L4::Irq>(cap_name, cap_name_len);
-  if (!cap)
-    {
-      Dbg(Dbg::Dev, Dbg::Warn, "virq")
-        .printf("%s: 'l4vmm,virq' property: capability %.*s is invalid.\n",
-                node.get_name(), cap_name_len, cap_name);
-      return L4::Cap<L4::Irq>();
-    }
-
-  return cap;
-}
 
 namespace {
 
@@ -55,15 +30,19 @@ struct F_rcv : Factory
   cxx::Ref_ptr<Device> create(Device_lookup *devs,
                               Dt_node const &node) override
   {
-    auto cap = get_irq_cap(node);
+    auto cap = Vdev::get_cap<L4::Irq>(node, "l4vmm,virqcap");
     if (!cap)
       return nullptr;
 
-    cxx::Ref_ptr<Gic::Ic> ic = devs->get_or_create_ic_dev(node, false);
-    if (!ic)
+    Vdev::Irq_dt_iterator it(devs, node);
+
+    if (it.next(devs) < 0)
       return nullptr;
 
-    auto c = make_device<Irq_rcv>(ic.get(), ic->dt_get_interrupt(node, 0));
+    if (!it.ic_is_virt())
+      L4Re::chksys(-L4_EINVAL, "Irq_rcv requires a virtual interrupt controller");
+
+    auto c = make_device<Irq_rcv>(it.ic().get(), it.irq());
     L4Re::chkcap(devs->vmm()->registry()->register_obj(c.get(), cap));
     return c;
   }
@@ -97,7 +76,7 @@ struct F_snd : Factory
   cxx::Ref_ptr<Device> create(Device_lookup *devs,
                               Dt_node const &node) override
   {
-    auto cap = get_irq_cap(node);
+    auto cap = Vdev::get_cap<L4::Irq>(node, "l4vmm,virqcap");
     if (!cap)
       return nullptr;
 

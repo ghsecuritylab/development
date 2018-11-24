@@ -64,9 +64,11 @@ private:
   Unsigned32 _features;
   Unsigned32 _ext_features;
   Unsigned32 _ext_07_ebx;
+  Unsigned32 _ext_07_edx;
   Unsigned32 _ext_8000_0001_ecx;
   Unsigned32 _ext_8000_0001_edx;
   Unsigned32 _local_features;
+  Unsigned64 _arch_capabilities;
 
   Unsigned16 _inst_tlb_4k_entries;
   Unsigned16 _data_tlb_4k_entries;
@@ -146,6 +148,15 @@ public:
 
   bool __attribute__((const)) has_smep() const
   { return _ext_07_ebx & FEATX_SMEP; }
+
+  bool __attribute__((const)) has_l1d_flush() const
+  { return (_ext_07_edx & FEATX_L1D_FLUSH); }
+
+  bool __attribute__((const)) has_arch_capabilities() const
+  { return (_ext_07_edx & FEATX_IA32_ARCH_CAPABILITIES); }
+
+  bool __attribute ((const)) skip_l1dfl_vmentry() const
+  { return (_arch_capabilities & (1UL << 3)); }
 
   unsigned ext_8000_0001_ecx() const { return _ext_8000_0001_ecx; }
   unsigned ext_8000_0001_edx() const { return _ext_8000_0001_edx; }
@@ -1235,8 +1246,10 @@ Cpu::identify()
 
     if (max >= 7 && _vendor == Vendor_intel)
       {
-        Unsigned32 dummy1, dummy2, dummy3;
-        cpuid(0x7, 0, &dummy1, &_ext_07_ebx, &dummy2, &dummy3);
+        Unsigned32 dummy1, dummy2;
+        cpuid(0x7, 0, &dummy1, &_ext_07_ebx, &dummy2, &_ext_07_edx);
+        if (has_arch_capabilities())
+          _arch_capabilities = rdmsr(MSR_IA32_ARCH_CAPABILITIES);
       }
 
     if (_vendor == Vendor_intel)
@@ -1389,9 +1402,8 @@ Cpu::show_cache_tlb_info(const char *indent) const
     putchar('\n');
 
   if (_l1_trace_cache_size)
-    printf("%s%3dK %c-ops T Cache (%d-way associative)\n",
-           indent, _l1_trace_cache_size, Config::char_micro,
-           _l1_trace_cache_asso);
+    printf("%s%3dK u-ops T Cache (%d-way associative)\n",
+           indent, _l1_trace_cache_size, _l1_trace_cache_asso);
 
   else if (_l1_inst_cache_size)
     printf("%s%4d KB L1 I Cache (%d-way associative, %d bytes per line)\n",
@@ -2068,13 +2080,15 @@ Cpu::init_indirect_branch_mitigation()
         panic("intel CPU does not support IBRS, IBPB, STIBP (cpuid max < 7)\n");
 
       cpuid(7, 0, &a, &b, &c, &d);
-      if (!(d & (1UL << 26)))
+      if (!(d & FEATX_IBRS_IBPB))
         panic("IBRS / IBPB not supported by CPU: %x\n", d);
 
-      if (!(d & (1UL << 27)))
+      if (!(d & FEATX_STIBP))
         panic("STIBP not supported by CPU: %x\n", d);
 
       // enable STIBP
       wrmsr(2, 0x48);
     }
+  else
+    panic("Kernel compiled with IBRS / IBPB, but not supported on non-Intel CPUs\n");
 }
